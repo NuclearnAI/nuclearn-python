@@ -65,8 +65,8 @@ client.upload(df, dataset_id=410, primary_key="wo_id", chunk_size=1000)
 
 ## More advanced functionality
 
-Health/auth diagnostics, queue depths, and anything else beyond uploading
-live in [docs/advanced.md](docs/advanced.md).
+The full function reference — health/auth diagnostics, queue depths, and
+everything else beyond uploading — lives in [docs/api.md](docs/api.md).
 
 ## Errors
 
