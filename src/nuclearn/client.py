@@ -142,6 +142,32 @@ class Client:
             **kwargs,
         )
 
+    # --- health checks ---
+
+    def connection_check(self, verbose: bool = False) -> bool:
+        """True if the instance's /health endpoint answers. No auth involved."""
+        return _check_connection(self.api_url, self.verify, self.timeout, verbose)
+
+    def auth_check(self, verbose: bool = False) -> bool:
+        """True if the configured credentials are accepted by the platform."""
+        try:
+            response = self._request("GET", "/auth/rules")
+        except AuthenticationError as exc:
+            return _check_failed(verbose, "auth_check", str(exc))
+        except requests.RequestException as exc:
+            return _check_failed(
+                verbose, "auth_check", f"could not reach {self.api_url}: {exc}"
+            )
+        if response.status_code != 200:
+            return _check_failed(
+                verbose,
+                "auth_check",
+                f"{self.api_url} answered {response.status_code}: "
+                f"{_error_detail(response)}",
+            )
+        _diagnose(verbose, f"auth_check: OK — credentials accepted by {self.api_url}")
+        return True
+
     # --- upload ---
 
     def upload(
@@ -177,6 +203,58 @@ class Client:
                 f"({response.status_code}): {_error_detail(response)}",
                 status_code=response.status_code,
             )
+
+
+def connection_check(
+    api_url: Optional[str] = None,
+    verify: Optional[bool] = None,
+    timeout: float = 10.0,
+    verbose: bool = False,
+) -> bool:
+    """Module-level convenience: reachability check needing no credentials."""
+    try:
+        url = Client._resolve_api_url(api_url)
+    except ConfigurationError as exc:
+        return _check_failed(verbose, "connection_check", str(exc))
+    return _check_connection(url, Client._resolve_verify(verify), timeout, verbose)
+
+
+def auth_check(verbose: bool = False, **client_kwargs: Any) -> bool:
+    """Module-level convenience: build a Client from env/kwargs and check auth."""
+    try:
+        client = Client(**client_kwargs)
+    except ConfigurationError as exc:
+        return _check_failed(verbose, "auth_check", str(exc))
+    return client.auth_check(verbose=verbose)
+
+
+def _check_connection(api_url: str, verify: bool, timeout: float, verbose: bool) -> bool:
+    if not verify:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    try:
+        response = requests.get(f"{api_url}/health", timeout=timeout, verify=verify)
+    except requests.RequestException as exc:
+        return _check_failed(
+            verbose, "connection_check", f"could not reach {api_url}/health: {exc}"
+        )
+    if response.status_code != 200:
+        return _check_failed(
+            verbose,
+            "connection_check",
+            f"{api_url}/health answered {response.status_code}",
+        )
+    _diagnose(verbose, f"connection_check: OK — {api_url}/health answered 200")
+    return True
+
+
+def _diagnose(verbose: bool, message: str) -> None:
+    if verbose:
+        print(message)
+
+
+def _check_failed(verbose: bool, check_name: str, reason: str) -> bool:
+    _diagnose(verbose, f"{check_name}: FAILED — {reason}")
+    return False
 
 
 def _dataframe_to_records(
