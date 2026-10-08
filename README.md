@@ -63,22 +63,10 @@ client.upload(df, dataset_id=410, primary_key="wo_id", chunk_size=1000)
   `UploadResult(dataset_id, records_sent, chunks)` once every chunk is
   accepted.
 
-## Troubleshooting
+## More advanced functionality
 
-Two diagnostics, both returning `True`/`False` — silent unless `verbose=True`,
-which prints what failed:
-
-```python
-client.connection_check()   # can the instance be reached at all? (no auth)
-client.auth_check()         # are the configured credentials accepted?
-```
-
-Module-level variants configure themselves from the environment and never
-raise, so they work as one-liners on a customer box:
-
-```bash
-python -c "import nuclearn; nuclearn.connection_check(verbose=True); nuclearn.auth_check(verbose=True)"
-```
+The full function reference — health/auth diagnostics, queue depths, and
+everything else beyond uploading — lives in [docs/api.md](docs/api.md).
 
 ## Errors
 
