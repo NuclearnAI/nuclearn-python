@@ -1,6 +1,6 @@
 """Nuclearn platform client library."""
 
-from .client import Client, UploadResult, auth_check, connection_check
+from .client import Client, UploadResult, auth_check, connection_check, queue_counts
 from .errors import (
     AuthenticationError,
     ConfigurationError,
@@ -15,6 +15,7 @@ __all__ = [
     "UploadResult",
     "connection_check",
     "auth_check",
+    "queue_counts",
     "NuclearnError",
     "ConfigurationError",
     "AuthenticationError",

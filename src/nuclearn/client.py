@@ -3,16 +3,19 @@
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from functools import partial
+from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 import requests
 import urllib3
 
-from .errors import AuthenticationError, ConfigurationError, UploadError
+from .errors import AuthenticationError, ConfigurationError, NuclearnError, UploadError
 
 _FALSE_STRINGS = {"0", "false", "no", "off"}
+_QUEUE_COUNT_ATTRIBUTE = re.compile(r"^(\w+_queue)_count$")
 
 
 @dataclass
@@ -168,6 +171,37 @@ class Client:
         _diagnose(verbose, f"auth_check: OK — credentials accepted by {self.api_url}")
         return True
 
+    # --- queue depths ---
+
+    def queue_counts(self) -> Dict[str, int]:
+        """Waiting-message count per Celery queue, keyed by queue name."""
+        response = self._request("GET", "/tasks/monitoring/overview")
+        if response.status_code != 200:
+            raise NuclearnError(
+                f"queue_counts failed ({response.status_code}): "
+                f"{_error_detail(response)}"
+            )
+        details = response.json()["queues"]["details"]
+        return {queue["name"]: int(queue["waiting"]) for queue in details}
+
+    def queue_count(self, queue: str) -> int:
+        """Waiting-message count for one queue by name."""
+        counts = self.queue_counts()
+        if queue not in counts:
+            raise NuclearnError(
+                f"No queue named {queue!r}; available: {', '.join(sorted(counts))}"
+            )
+        return counts[queue]
+
+    def __getattr__(self, name: str) -> Callable[[], int]:
+        """Resolve <queue_name>_count() methods against the live queue list."""
+        match = _QUEUE_COUNT_ATTRIBUTE.match(name)
+        if match:
+            return partial(self.queue_count, match.group(1))
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
+
     # --- upload ---
 
     def upload(
@@ -226,6 +260,11 @@ def auth_check(verbose: bool = False, **client_kwargs: Any) -> bool:
     except ConfigurationError as exc:
         return _check_failed(verbose, "auth_check", str(exc))
     return client.auth_check(verbose=verbose)
+
+
+def queue_counts(**client_kwargs: Any) -> Dict[str, int]:
+    """Module-level convenience: build a Client from env/kwargs, return counts."""
+    return Client(**client_kwargs).queue_counts()
 
 
 def _check_connection(api_url: str, verify: bool, timeout: float, verbose: bool) -> bool:
