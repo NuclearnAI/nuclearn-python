@@ -1,0 +1,226 @@
+"""Client for the Nuclearn platform API."""
+
+import hashlib
+import json
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+import requests
+import urllib3
+
+from .errors import AuthenticationError, ConfigurationError, UploadError
+
+_FALSE_STRINGS = {"0", "false", "no", "off"}
+
+
+@dataclass
+class UploadResult:
+    """Summary of a completed upload."""
+
+    dataset_id: int
+    records_sent: int
+    chunks: int
+
+
+class Client:
+    """Authenticated connection to a Nuclearn platform instance.
+
+    Configuration falls back to environment variables:
+    NUCLEARN_API_URL, NUCLEARN_API_KEY, NUCLEARN_USERNAME,
+    NUCLEARN_PASSWORD, NUCLEARN_VERIFY_SSL.
+    """
+
+    def __init__(
+        self,
+        api_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        verify: Optional[bool] = None,
+        timeout: float = 60.0,
+    ):
+        self.api_url = self._resolve_api_url(api_url)
+        self._api_key = api_key or os.getenv("NUCLEARN_API_KEY")
+        self._username = username or os.getenv("NUCLEARN_USERNAME")
+        self._password = password or os.getenv("NUCLEARN_PASSWORD")
+        self._validate_credentials()
+        self.verify = self._resolve_verify(verify)
+        if not self.verify:
+            # The user explicitly opted out of TLS verification (self-signed
+            # dev instances); without this every request emits a warning.
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        self.timeout = timeout
+        self._session = requests.Session()
+        self._access_token: Optional[str] = None
+
+    # --- configuration ---
+
+    @staticmethod
+    def _resolve_api_url(api_url: Optional[str]) -> str:
+        url = api_url or os.getenv("NUCLEARN_API_URL")
+        if not url:
+            raise ConfigurationError(
+                "No API URL configured. Pass api_url= or set NUCLEARN_API_URL."
+            )
+        return url.rstrip("/")
+
+    def _validate_credentials(self) -> None:
+        if self._api_key:
+            return
+        if self._username and self._password:
+            return
+        raise ConfigurationError(
+            "No credentials configured. Set NUCLEARN_API_KEY (preferred), or "
+            "both NUCLEARN_USERNAME and NUCLEARN_PASSWORD, or pass the "
+            "equivalent keyword arguments."
+        )
+
+    @staticmethod
+    def _resolve_verify(verify: Optional[bool]) -> bool:
+        if verify is not None:
+            return verify
+        env = os.getenv("NUCLEARN_VERIFY_SSL")
+        if env is not None and env.strip().lower() in _FALSE_STRINGS:
+            return False
+        return True
+
+    # --- auth ---
+
+    def _auth_headers(self) -> Dict[str, str]:
+        if self._api_key:
+            return {"X-API-KEY": self._api_key}
+        if self._access_token is None:
+            self._access_token = self._login()
+        return {"Authorization": f"Bearer {self._access_token}"}
+
+    def _fetch_csrf_token(self) -> str:
+        response = self._session.get(
+            f"{self.api_url}/auth/csrf-token",
+            timeout=self.timeout,
+            verify=self.verify,
+        )
+        response.raise_for_status()
+        return response.json()["csrf_token"]
+
+    def _login(self) -> str:
+        response = self._session.post(
+            f"{self.api_url}/auth/login",
+            json={"username": self._username, "password": self._password},
+            headers={"X-CSRF-Token": self._fetch_csrf_token()},
+            timeout=self.timeout,
+            verify=self.verify,
+        )
+        if response.status_code in (401, 403):
+            raise AuthenticationError(
+                "Login failed: the platform rejected the username/password. "
+                "Note: repeated failures temporarily lock the account."
+            )
+        response.raise_for_status()
+        return response.json()["access_token"]
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        """Issue an authenticated request, re-logging in once on token expiry."""
+        response = self._send(method, path, **kwargs)
+        if response.status_code == 401 and not self._api_key:
+            self._access_token = None
+            response = self._send(method, path, **kwargs)
+        if response.status_code == 401:
+            raise AuthenticationError(
+                "The platform rejected the configured credentials (401)."
+            )
+        return response
+
+    def _send(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        return self._session.request(
+            method,
+            f"{self.api_url}{path}",
+            headers=self._auth_headers(),
+            timeout=self.timeout,
+            verify=self.verify,
+            **kwargs,
+        )
+
+    # --- upload ---
+
+    def upload(
+        self,
+        df: pd.DataFrame,
+        dataset_id: int,
+        primary_key: Optional[str] = None,
+        chunk_size: int = 1000,
+    ) -> UploadResult:
+        """Upsert a DataFrame into a dataset.
+
+        Each row becomes one record. With primary_key, rows upsert by that
+        column's value; without it, by a hash of the row's content (so
+        re-uploading the same rows is idempotent).
+        """
+        records = _dataframe_to_records(df, primary_key)
+        chunks = _split_into_chunks(records, chunk_size)
+        for chunk in chunks:
+            self._upsert_chunk(dataset_id, chunk)
+        return UploadResult(
+            dataset_id=dataset_id, records_sent=len(records), chunks=len(chunks)
+        )
+
+    def _upsert_chunk(self, dataset_id: int, chunk: List[Dict[str, Any]]) -> None:
+        response = self._request(
+            "PUT",
+            f"/datasets/{dataset_id}/upsert-source-multirecords",
+            json={"data": chunk},
+        )
+        if response.status_code != 200:
+            raise UploadError(
+                f"Upload to dataset {dataset_id} failed "
+                f"({response.status_code}): {_error_detail(response)}",
+                status_code=response.status_code,
+            )
+
+
+def _dataframe_to_records(
+    df: pd.DataFrame, primary_key: Optional[str]
+) -> List[Dict[str, Any]]:
+    # to_json handles NaN/NaT -> null and datetimes -> ISO strings.
+    rows = json.loads(df.to_json(orient="records", date_format="iso"))
+    if primary_key is not None:
+        uids = _primary_key_uids(df, primary_key)
+        return [{"data": row, "source_uid": uid} for row, uid in zip(rows, uids)]
+    return _content_hashed_records(rows)
+
+
+def _primary_key_uids(df: pd.DataFrame, primary_key: str) -> List[str]:
+    if primary_key not in df.columns:
+        raise UploadError(f"primary_key column {primary_key!r} is not in the DataFrame")
+    values = df[primary_key]
+    if values.isna().any():
+        raise UploadError(f"primary_key column {primary_key!r} contains null values")
+    uids = [str(value) for value in values]
+    if len(set(uids)) != len(uids):
+        raise UploadError(f"primary_key column {primary_key!r} contains duplicate values")
+    return uids
+
+
+def _content_hashed_records(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Key each row by a hash of its content; identical rows collapse to one."""
+    records: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        digest = hashlib.sha256(
+            json.dumps(row, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        records[digest] = {"data": row, "source_uid": digest}
+    return list(records.values())
+
+
+def _split_into_chunks(
+    records: List[Dict[str, Any]], chunk_size: int
+) -> List[List[Dict[str, Any]]]:
+    return [records[i : i + chunk_size] for i in range(0, len(records), chunk_size)]
+
+
+def _error_detail(response: requests.Response) -> str:
+    try:
+        return str(response.json().get("detail", response.text))
+    except ValueError:
+        return response.text
