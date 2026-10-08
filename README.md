@@ -63,7 +63,7 @@ client.upload(df, dataset_id=410, primary_key="wo_id", chunk_size=1000)
   `UploadResult(dataset_id, records_sent, chunks)` once every chunk is
   accepted.
 
-## More advanced functionality
+## Further Documentation
 
 The full function reference — health/auth diagnostics, queue depths, and
 everything else beyond uploading — lives in [docs/api.md](docs/api.md).
